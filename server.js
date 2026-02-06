@@ -40,9 +40,9 @@ function generateSessionId() {
 }
 
 // ============================================
-// COLUMN MAPPINGS
+// COLUMN MAPPINGS - WELLS
 // ============================================
-const columnMappings = {
+const wellsColumnMappings = {
   nome: 'name',
   'nome do poço': 'name',
   poço: 'name',
@@ -80,9 +80,44 @@ const columnMappings = {
   decline_rate: 'decline_rate',
 };
 
-function normalizeColumnName(name) {
+// ============================================
+// COLUMN MAPPINGS - PRODUCTION
+// ============================================
+const productionColumnMappings = {
+  wlbr_id: 'wlbr_id',
+  wellbore_id: 'wlbr_id',
+  'id do poço': 'wlbr_id',
+  cmpl_id: 'cmpl_id',
+  completion_id: 'cmpl_id',
+  daytime: 'production_date',
+  date: 'production_date',
+  data: 'production_date',
+  'data produção': 'production_date',
+  oil: 'oil_volume',
+  óleo: 'oil_volume',
+  petroleo: 'oil_volume',
+  petróleo: 'oil_volume',
+  water: 'water_volume',
+  água: 'water_volume',
+  agua: 'water_volume',
+  gas: 'gas_volume',
+  gás: 'gas_volume',
+  glg: 'glg',
+  'gas lift': 'glg',
+  hours: 'hours_produced',
+  horas: 'hours_produced',
+  choke: 'choke_size',
+  bhp: 'bhp',
+  bht: 'bht',
+  whp: 'whp',
+  wht: 'wht',
+  chp: 'chp',
+};
+
+function normalizeColumnName(name, dataType) {
   const normalized = String(name).toLowerCase().trim();
-  return columnMappings[normalized] || normalized;
+  const mappings = dataType === 'production' ? productionColumnMappings : wellsColumnMappings;
+  return mappings[normalized] || normalized;
 }
 
 function normalizeType(val) {
@@ -120,6 +155,136 @@ function parseDate(val) {
     return date.toISOString().split('T')[0];
   } catch {
     return null;
+  }
+}
+
+// ============================================
+// DETECT DATA TYPE
+// ============================================
+function detectDataType(columns) {
+  const normalized = columns.map(c => c.toLowerCase());
+  const productionIndicators = ['oil', 'gas', 'water', 'daytime', 'wlbr_id', 'cmpl_id', 'bhp', 'whp', 'choke'];
+  const wellIndicators = ['latitude', 'longitude', 'block', 'field', 'province', 'poço', 'poco', 'bloco', 'campo'];
+  
+  const productionMatches = productionIndicators.filter(ind => 
+    normalized.some(col => col.includes(ind))
+  ).length;
+  
+  const wellMatches = wellIndicators.filter(ind => 
+    normalized.some(col => col.includes(ind))
+  ).length;
+  
+  console.log(`[detectDataType] production=${productionMatches}, wells=${wellMatches}`);
+  return productionMatches > wellMatches ? 'production' : 'wells';
+}
+
+// ============================================
+// PARSE WELLS ROW
+// ============================================
+function parseWellsRow(row, columns, rowIndex) {
+  const original = {};
+  const mapped = {};
+
+  columns.forEach((col) => {
+    const normalizedCol = normalizeColumnName(col, 'wells');
+    original[col] = row[col];
+    mapped[normalizedCol] = row[col];
+  });
+
+  const errors = [];
+
+  if (!mapped.name) errors.push('Nome do poço é obrigatório');
+  if (!mapped.block) errors.push('Bloco é obrigatório');
+  if (!mapped.field) errors.push('Campo é obrigatório');
+  if (!mapped.province) errors.push('Província é obrigatória');
+
+  const latitude = parseNumber(mapped.latitude);
+  const longitude = parseNumber(mapped.longitude);
+  const depth = parseNumber(mapped.depth);
+
+  if (latitude === null || latitude < -90 || latitude > 90) errors.push('Latitude inválida');
+  if (longitude === null || longitude < -180 || longitude > 180) errors.push('Longitude inválida');
+  if (depth === null || depth < 0) errors.push('Profundidade inválida');
+
+  const type = normalizeType(mapped.type);
+  if (!['oil', 'gas', 'mixed'].includes(type)) errors.push('Tipo deve ser: petróleo, gás ou misto');
+
+  const status = normalizeStatus(mapped.status);
+  if (!['active', 'inactive', 'exploratory', 'declining'].includes(status)) {
+    errors.push('Status deve ser: ativo, inativo, exploratório ou declínio');
+  }
+
+  if (errors.length === 0) {
+    return {
+      row: rowIndex + 1,
+      data: {
+        name: String(mapped.name),
+        block: String(mapped.block),
+        field: String(mapped.field),
+        province: String(mapped.province),
+        latitude,
+        longitude,
+        depth,
+        type,
+        estimated_reserves: parseNumber(mapped.estimated_reserves) || 0,
+        daily_production: parseNumber(mapped.daily_production) || 0,
+        production_start_date: parseDate(mapped.production_start_date),
+        status,
+        decline_rate: parseNumber(mapped.decline_rate) || 0,
+      },
+      errors: [],
+      original,
+    };
+  } else {
+    return { row: rowIndex + 1, data: null, errors, original };
+  }
+}
+
+// ============================================
+// PARSE PRODUCTION ROW
+// ============================================
+function parseProductionRow(row, columns, rowIndex) {
+  const original = {};
+  const mapped = {};
+
+  columns.forEach((col) => {
+    const normalizedCol = normalizeColumnName(col, 'production');
+    original[col] = row[col];
+    mapped[normalizedCol] = row[col];
+  });
+
+  const errors = [];
+
+  const wlbrId = mapped.wlbr_id;
+  if (!wlbrId) errors.push('Wellbore ID é obrigatório');
+
+  const productionDate = parseDate(mapped.production_date);
+  if (!productionDate) errors.push('Data de produção é obrigatória');
+
+  if (errors.length === 0) {
+    return {
+      row: rowIndex + 1,
+      data: {
+        wlbr_id: String(wlbrId),
+        cmpl_id: mapped.cmpl_id ? String(mapped.cmpl_id) : null,
+        production_date: productionDate,
+        oil_volume: parseNumber(mapped.oil_volume) || 0,
+        water_volume: parseNumber(mapped.water_volume) || 0,
+        gas_volume: parseNumber(mapped.gas_volume) || 0,
+        glg: parseNumber(mapped.glg) || 0,
+        hours_produced: parseNumber(mapped.hours_produced) || 0,
+        choke_size: parseNumber(mapped.choke_size) || 0,
+        bhp: parseNumber(mapped.bhp) || 0,
+        bht: parseNumber(mapped.bht) || 0,
+        whp: parseNumber(mapped.whp) || 0,
+        wht: parseNumber(mapped.wht) || 0,
+        chp: parseNumber(mapped.chp) || 0,
+      },
+      errors: [],
+      original,
+    };
+  } else {
+    return { row: rowIndex + 1, data: null, errors, original };
   }
 }
 
@@ -215,72 +380,29 @@ app.post('/parse-table', upload.single('file'), async (req, res) => {
     const columns = table.getColumnNames();
     const data = table.getData();
 
+    // Detect data type based on columns
+    const dataType = detectDataType(columns);
+    console.log(`[parse-table] Detected data type: ${dataType} for table ${tableName}`);
+
     const totalRows = data.length;
     const success = [];
     const failed = [];
 
     for (let i = 0; i < data.length; i++) {
       const row = data[i];
-      const original = {};
-      const mapped = {};
+      const result = dataType === 'production' 
+        ? parseProductionRow(row, columns, i)
+        : parseWellsRow(row, columns, i);
 
-      columns.forEach((col) => {
-        const normalizedCol = normalizeColumnName(col);
-        original[col] = row[col];
-        mapped[normalizedCol] = row[col];
-      });
-
-      const errors = [];
-
-      if (!mapped.name) errors.push('Nome do poço é obrigatório');
-      if (!mapped.block) errors.push('Bloco é obrigatório');
-      if (!mapped.field) errors.push('Campo é obrigatório');
-      if (!mapped.province) errors.push('Província é obrigatória');
-
-      const latitude = parseNumber(mapped.latitude);
-      const longitude = parseNumber(mapped.longitude);
-      const depth = parseNumber(mapped.depth);
-
-      if (latitude === null || latitude < -90 || latitude > 90) errors.push('Latitude inválida');
-      if (longitude === null || longitude < -180 || longitude > 180) errors.push('Longitude inválida');
-      if (depth === null || depth < 0) errors.push('Profundidade inválida');
-
-      const type = normalizeType(mapped.type);
-      if (!['oil', 'gas', 'mixed'].includes(type)) errors.push('Tipo deve ser: petróleo, gás ou misto');
-
-      const status = normalizeStatus(mapped.status);
-      if (!['active', 'inactive', 'exploratory', 'declining'].includes(status)) {
-        errors.push('Status deve ser: ativo, inativo, exploratório ou declínio');
-      }
-
-      if (errors.length === 0) {
-        success.push({
-          row: i + 1,
-          data: {
-            name: String(mapped.name),
-            block: String(mapped.block),
-            field: String(mapped.field),
-            province: String(mapped.province),
-            latitude,
-            longitude,
-            depth,
-            type,
-            estimated_reserves: parseNumber(mapped.estimated_reserves) || 0,
-            daily_production: parseNumber(mapped.daily_production) || 0,
-            production_start_date: parseDate(mapped.production_start_date),
-            status,
-            decline_rate: parseNumber(mapped.decline_rate) || 0,
-          },
-          errors: [],
-          original,
-        });
+      if (result.data) {
+        success.push(result);
       } else {
-        failed.push({ row: i + 1, data: null, errors, original });
+        failed.push(result);
       }
     }
 
     console.log(`[parse-table] Processed ${totalRows} rows: ${success.length} valid, ${failed.length} failed`);
-    res.json({ success: true, parseResult: { success, failed, totalRows } });
+    res.json({ success: true, parseResult: { success, failed, totalRows }, dataType });
   } catch (err) {
     console.error('[parse-table] Error:', err);
     res.status(500).json({ success: false, error: err.message || 'Erro ao processar tabela' });
