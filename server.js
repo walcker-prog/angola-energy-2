@@ -2,6 +2,7 @@ import express from 'express';
 import multer from 'multer';
 import cors from 'cors';
 import MDBReader from 'mdb-reader';
+import crypto from 'crypto';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -16,12 +17,31 @@ const upload = multer({
 app.use(cors());
 app.use(express.json());
 
-// Health check endpoint
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
-});
+// ============================================
+// FILE SESSION CACHE
+// Keep uploaded files in memory to avoid re-uploads
+// ============================================
+const fileCache = new Map(); // sessionId -> { buffer, filename, timestamp }
+const SESSION_TIMEOUT = 30 * 60 * 1000; // 30 minutes
 
-// Column name mappings (Portuguese to English)
+// Clean up expired sessions periodically
+setInterval(() => {
+  const now = Date.now();
+  for (const [sessionId, data] of fileCache.entries()) {
+    if (now - data.timestamp > SESSION_TIMEOUT) {
+      console.log(`[cache] Expiring session: ${sessionId}`);
+      fileCache.delete(sessionId);
+    }
+  }
+}, 5 * 60 * 1000); // Check every 5 minutes
+
+function generateSessionId() {
+  return crypto.randomBytes(16).toString('hex');
+}
+
+// ============================================
+// COLUMN MAPPINGS
+// ============================================
 const columnMappings = {
   nome: 'name',
   'nome do poço': 'name',
@@ -103,7 +123,18 @@ function parseDate(val) {
   }
 }
 
-// List tables endpoint
+// Health check endpoint
+app.get('/health', (req, res) => {
+  res.json({ 
+    status: 'ok', 
+    timestamp: new Date().toISOString(),
+    activeSessions: fileCache.size 
+  });
+});
+
+// ============================================
+// LIST TABLES - Upload file and return sessionId
+// ============================================
 app.post('/list-tables', upload.single('file'), async (req, res) => {
   try {
     if (!req.file) {
@@ -111,6 +142,16 @@ app.post('/list-tables', upload.single('file'), async (req, res) => {
     }
 
     console.log(`[list-tables] Processing file: ${req.file.originalname}, size: ${req.file.size} bytes`);
+
+    // Generate session ID and cache the file
+    const sessionId = generateSessionId();
+    fileCache.set(sessionId, {
+      buffer: req.file.buffer,
+      filename: req.file.originalname,
+      timestamp: Date.now(),
+    });
+
+    console.log(`[list-tables] Created session: ${sessionId}`);
 
     const reader = new MDBReader(req.file.buffer);
     const tableNames = reader.getTableNames();
@@ -128,28 +169,48 @@ app.post('/list-tables', upload.single('file'), async (req, res) => {
     });
 
     console.log(`[list-tables] Found ${tables.length} tables`);
-    res.json({ success: true, tables });
+    
+    // Return sessionId so client can use it for parse-table
+    res.json({ success: true, tables, sessionId });
   } catch (err) {
     console.error('[list-tables] Error:', err);
     res.status(500).json({ success: false, error: err.message || 'Erro ao processar arquivo' });
   }
 });
 
-// Parse table endpoint
+// ============================================
+// PARSE TABLE - Use sessionId OR upload file
+// ============================================
 app.post('/parse-table', upload.single('file'), async (req, res) => {
   try {
-    if (!req.file) {
-      return res.status(400).json({ success: false, error: 'Arquivo não fornecido' });
-    }
-
     const tableName = req.body.tableName;
     if (!tableName) {
       return res.status(400).json({ success: false, error: 'Nome da tabela não fornecido' });
     }
 
-    console.log(`[parse-table] Processing table: ${tableName}, file size: ${req.file.size} bytes`);
+    let buffer;
+    const sessionId = req.body.sessionId;
 
-    const reader = new MDBReader(req.file.buffer);
+    // Try to get file from session cache first
+    if (sessionId && fileCache.has(sessionId)) {
+      console.log(`[parse-table] Using cached file from session: ${sessionId}`);
+      const cached = fileCache.get(sessionId);
+      cached.timestamp = Date.now(); // Refresh timestamp
+      buffer = cached.buffer;
+    } else if (req.file) {
+      // Fallback to uploaded file
+      console.log(`[parse-table] Using uploaded file: ${req.file.originalname}, size: ${req.file.size} bytes`);
+      buffer = req.file.buffer;
+    } else {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Arquivo não fornecido. Sessão pode ter expirado - faça upload novamente.' 
+      });
+    }
+
+    console.log(`[parse-table] Processing table: ${tableName}`);
+
+    const reader = new MDBReader(buffer);
     const table = reader.getTable(tableName);
     const columns = table.getColumnNames();
     const data = table.getData();
@@ -223,6 +284,21 @@ app.post('/parse-table', upload.single('file'), async (req, res) => {
   } catch (err) {
     console.error('[parse-table] Error:', err);
     res.status(500).json({ success: false, error: err.message || 'Erro ao processar tabela' });
+  }
+});
+
+// ============================================
+// CLEAR SESSION - Clean up cached file
+// ============================================
+app.post('/clear-session', express.json(), (req, res) => {
+  const { sessionId } = req.body;
+  
+  if (sessionId && fileCache.has(sessionId)) {
+    fileCache.delete(sessionId);
+    console.log(`[clear-session] Deleted session: ${sessionId}`);
+    res.json({ success: true });
+  } else {
+    res.json({ success: false, error: 'Session not found' });
   }
 });
 
