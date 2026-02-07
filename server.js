@@ -328,10 +328,13 @@ app.post('/list-tables', upload.single('file'), async (req, res) => {
 
     const tables = tableNames.map((name) => {
       try {
-        const table = reader.getTable(name);
-        const columns = table.getColumnNames();
-        const data = table.getData();
-        return { name, rowCount: data.length, columns };
+    const table = reader.getTable(name);
+    const columns = table.getColumnNames();
+    // IMPORTANT: do NOT call table.getData() here.
+    // For large databases, loading all rows of every table can exhaust memory and
+    // crash/reset the process, which surfaces in the client as a network upload error.
+    const rowCount = typeof table.rowCount === 'number' ? table.rowCount : 0;
+    return { name, rowCount, columns };
       } catch (err) {
         console.error(`Error reading table ${name}:`, err);
         return { name, rowCount: 0, columns: [] };
