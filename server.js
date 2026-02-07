@@ -40,6 +40,24 @@ const upload = multer({
   limits: { fileSize: 200 * 1024 * 1024 }, // 200 MB
 });
 
+// ============================================
+// CHUNKED UPLOAD (avoid proxy timeouts)
+// ============================================
+const CHUNK_SIZE = Number(process.env.CHUNK_SIZE_BYTES) || 8 * 1024 * 1024; // 8 MB
+const CHUNKS_DIR = path.join(UPLOADS_DIR, '_chunks');
+
+if (!fs.existsSync(CHUNKS_DIR)) {
+  fs.mkdirSync(CHUNKS_DIR, { recursive: true });
+}
+
+// Keep each request small; store chunk in memory then persist to disk.
+const chunkUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: CHUNK_SIZE + 1024 * 1024 }, // chunk + overhead
+});
+
+const chunkSessions = new Map(); // uploadId -> { dirPath, filename, totalChunks, size, createdAt }
+
 // Enable CORS for all origins
 app.use(cors());
 app.use(express.json());
@@ -54,6 +72,8 @@ const SESSION_TIMEOUT = 60 * 60 * 1000; // 60 minutes
 // Clean up expired sessions periodically (also delete files from disk)
 setInterval(() => {
   const now = Date.now();
+
+  // Expire parse sessions
   for (const [sessionId, data] of fileCache.entries()) {
     if (now - data.timestamp > SESSION_TIMEOUT) {
       console.log(`[cache] Expiring session: ${sessionId}`);
@@ -69,10 +89,80 @@ setInterval(() => {
       fileCache.delete(sessionId);
     }
   }
+
+  // Expire chunk uploads (keep a bit longer than normal sessions)
+  const CHUNK_TIMEOUT = 2 * 60 * 60 * 1000; // 2 hours
+  for (const [uploadId, data] of chunkSessions.entries()) {
+    if (now - data.createdAt > CHUNK_TIMEOUT) {
+      console.log(`[chunks] Expiring upload: ${uploadId}`);
+      if (data.dirPath && fs.existsSync(data.dirPath)) {
+        try {
+          fs.rmSync(data.dirPath, { recursive: true, force: true });
+          console.log(`[chunks] Deleted dir: ${data.dirPath}`);
+        } catch (e) {
+          console.error(`[chunks] Failed to delete dir: ${data.dirPath}`, e);
+        }
+      }
+      chunkSessions.delete(uploadId);
+    }
+  }
 }, 5 * 60 * 1000); // Check every 5 minutes
 
 function generateSessionId() {
   return crypto.randomBytes(16).toString('hex');
+}
+
+function generateUploadId() {
+  return crypto.randomBytes(16).toString('hex');
+}
+
+function sanitizeFilename(filename) {
+  return String(filename || 'upload.accdb')
+    .replace(/[/\\?%*:|"<>]/g, '_')
+    .slice(0, 200);
+}
+
+function ensureDir(dirPath) {
+  if (!fs.existsSync(dirPath)) {
+    fs.mkdirSync(dirPath, { recursive: true });
+  }
+}
+
+function getChunkDir(uploadId) {
+  return path.join(CHUNKS_DIR, uploadId);
+}
+
+function getChunkPath(uploadId, index) {
+  return path.join(getChunkDir(uploadId), `${index}.part`);
+}
+
+function assertChunkSession(uploadId) {
+  if (!uploadId || !chunkSessions.has(uploadId)) {
+    const err = new Error('Upload não encontrado ou expirado. Reenvie o arquivo.');
+    // @ts-ignore
+    err.statusCode = 400;
+    throw err;
+  }
+  return chunkSessions.get(uploadId);
+}
+
+function assembleChunksSync(uploadId, totalChunks, outFilePath) {
+  const fd = fs.openSync(outFilePath, 'w');
+  try {
+    for (let i = 0; i < totalChunks; i++) {
+      const chunkPath = getChunkPath(uploadId, i);
+      if (!fs.existsSync(chunkPath)) {
+        const err = new Error(`Chunk ausente: ${i}/${totalChunks - 1}`);
+        // @ts-ignore
+        err.statusCode = 400;
+        throw err;
+      }
+      const buf = fs.readFileSync(chunkPath);
+      fs.writeSync(fd, buf);
+    }
+  } finally {
+    fs.closeSync(fd);
+  }
 }
 
 /**
@@ -338,11 +428,172 @@ function parseProductionRow(row, columns, rowIndex) {
 
 // Health check endpoint
 app.get('/health', (req, res) => {
-  res.json({ 
-    status: 'ok', 
+  res.json({
+    status: 'ok',
     timestamp: new Date().toISOString(),
-    activeSessions: fileCache.size 
+    activeSessions: fileCache.size,
+    activeChunkUploads: chunkSessions.size,
+    chunkSizeBytes: CHUNK_SIZE,
   });
+});
+
+// ============================================
+// CHUNKED UPLOAD - INIT / CHUNK / COMPLETE
+// ============================================
+app.post('/upload-init', (req, res) => {
+  try {
+    const { filename, size, totalChunks } = req.body || {};
+
+    if (!filename || typeof filename !== 'string') {
+      return res.status(400).json({ success: false, error: 'Nome do arquivo inválido' });
+    }
+
+    const uploadId = generateUploadId();
+    const dirPath = getChunkDir(uploadId);
+    ensureDir(dirPath);
+
+    chunkSessions.set(uploadId, {
+      dirPath,
+      filename: sanitizeFilename(filename),
+      totalChunks: Number(totalChunks) || null,
+      size: Number(size) || null,
+      createdAt: Date.now(),
+    });
+
+    console.log(`[upload-init] uploadId=${uploadId}, file=${filename}, size=${size}, totalChunks=${totalChunks}`);
+    res.json({ success: true, uploadId, chunkSize: CHUNK_SIZE });
+  } catch (err) {
+    console.error('[upload-init] Error:', err);
+    res.status(500).json({ success: false, error: err.message || 'Erro ao iniciar upload' });
+  }
+});
+
+app.post('/upload-chunk', chunkUpload.single('chunk'), (req, res) => {
+  try {
+    const uploadId = req.body?.uploadId;
+    const indexRaw = req.body?.index;
+    const totalChunksRaw = req.body?.totalChunks;
+
+    const index = Number(indexRaw);
+    const totalChunks = Number(totalChunksRaw);
+
+    if (!uploadId) {
+      return res.status(400).json({ success: false, error: 'uploadId não fornecido' });
+    }
+
+    if (!Number.isFinite(index) || index < 0) {
+      return res.status(400).json({ success: false, error: 'index inválido' });
+    }
+
+    if (!Number.isFinite(totalChunks) || totalChunks <= 0) {
+      return res.status(400).json({ success: false, error: 'totalChunks inválido' });
+    }
+
+    const session = assertChunkSession(uploadId);
+    session.createdAt = Date.now(); // keep alive
+    if (!session.totalChunks) session.totalChunks = totalChunks;
+
+    if (!req.file || !req.file.buffer) {
+      return res.status(400).json({ success: false, error: 'Chunk não fornecido' });
+    }
+
+    const dirPath = session.dirPath;
+    ensureDir(dirPath);
+
+    const chunkPath = getChunkPath(uploadId, index);
+
+    // Idempotent write: if already exists, we accept it.
+    if (!fs.existsSync(chunkPath)) {
+      fs.writeFileSync(chunkPath, req.file.buffer);
+    }
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[upload-chunk] Error:', err);
+    const status = err.statusCode || 500;
+    res.status(status).json({ success: false, error: err.message || 'Erro ao receber chunk' });
+  }
+});
+
+app.post('/upload-complete', async (req, res) => {
+  try {
+    const { uploadId } = req.body || {};
+    const session = assertChunkSession(uploadId);
+
+    const totalChunks = Number(session.totalChunks);
+    if (!Number.isFinite(totalChunks) || totalChunks <= 0) {
+      return res.status(400).json({ success: false, error: 'totalChunks ausente/ inválido' });
+    }
+
+    const sessionId = generateSessionId();
+    const finalFilename = `${uploadId}-${session.filename}`;
+    const finalPath = path.join(UPLOADS_DIR, finalFilename);
+
+    console.log(`[upload-complete] Assembling uploadId=${uploadId} into ${finalPath}`);
+
+    assembleChunksSync(uploadId, totalChunks, finalPath);
+
+    // Clean up chunks directory
+    try {
+      fs.rmSync(session.dirPath, { recursive: true, force: true });
+    } catch (e) {
+      console.warn('[upload-complete] Failed to delete chunks dir:', e);
+    }
+    chunkSessions.delete(uploadId);
+
+    // Cache file path for later parsing
+    fileCache.set(sessionId, {
+      filePath: finalPath,
+      filename: session.filename,
+      timestamp: Date.now(),
+    });
+
+    console.log(`[upload-complete] Created session: ${sessionId}`);
+
+    // Parse tables (like /list-tables)
+    const buffer = readFileBuffer(finalPath);
+    const reader = new MDBReader(buffer);
+    const tableNames = reader.getTableNames();
+
+    const tables = tableNames.map((name) => {
+      try {
+        const table = reader.getTable(name);
+        const columns = table.getColumnNames();
+        const rowCount = typeof table.rowCount === 'number' ? table.rowCount : 0;
+        return { name, rowCount, columns };
+      } catch (err) {
+        console.error(`Error reading table ${name}:`, err);
+        return { name, rowCount: 0, columns: [] };
+      }
+    });
+
+    console.log(`[upload-complete] Found ${tables.length} tables`);
+    res.json({ success: true, tables, sessionId });
+  } catch (err) {
+    console.error('[upload-complete] Error:', err);
+    const status = err.statusCode || 500;
+    res.status(status).json({ success: false, error: err.message || 'Erro ao finalizar upload' });
+  }
+});
+
+app.post('/upload-abort', (req, res) => {
+  try {
+    const { uploadId } = req.body || {};
+    if (!uploadId || !chunkSessions.has(uploadId)) {
+      return res.json({ success: true });
+    }
+
+    const session = chunkSessions.get(uploadId);
+    if (session?.dirPath && fs.existsSync(session.dirPath)) {
+      fs.rmSync(session.dirPath, { recursive: true, force: true });
+    }
+
+    chunkSessions.delete(uploadId);
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[upload-abort] Error:', err);
+    res.status(500).json({ success: false, error: err.message || 'Erro ao abortar upload' });
+  }
 });
 
 // ============================================
