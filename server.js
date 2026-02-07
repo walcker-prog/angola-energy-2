@@ -22,7 +22,7 @@ app.use(express.json());
 // Keep uploaded files in memory to avoid re-uploads
 // ============================================
 const fileCache = new Map(); // sessionId -> { buffer, filename, timestamp }
-const SESSION_TIMEOUT = 30 * 60 * 1000; // 30 minutes
+const SESSION_TIMEOUT = 60 * 60 * 1000; // 60 minutes
 
 // Clean up expired sessions periodically
 setInterval(() => {
@@ -87,6 +87,10 @@ const productionColumnMappings = {
   wlbr_id: 'wlbr_id',
   wellbore_id: 'wlbr_id',
   'id do poço': 'wlbr_id',
+  wlbr_nm: 'wlbr_nm',
+  wellbore_name: 'wlbr_nm',
+  'nome do poço': 'wlbr_nm',
+  'wellbore name': 'wlbr_nm',
   cmpl_id: 'cmpl_id',
   completion_id: 'cmpl_id',
   daytime: 'production_date',
@@ -266,6 +270,7 @@ function parseProductionRow(row, columns, rowIndex) {
       row: rowIndex + 1,
       data: {
         wlbr_id: String(wlbrId),
+        wlbr_nm: mapped.wlbr_nm ? String(mapped.wlbr_nm) : null,
         cmpl_id: mapped.cmpl_id ? String(mapped.cmpl_id) : null,
         production_date: productionDate,
         oil_volume: parseNumber(mapped.oil_volume) || 0,
