@@ -3,13 +3,40 @@ import multer from 'multer';
 import cors from 'cors';
 import MDBReader from 'mdb-reader';
 import crypto from 'crypto';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Configure multer for file uploads (200 MB limit)
+// ============================================
+// DISK STORAGE CONFIGURATION
+// Store uploads on disk to avoid memory exhaustion on large files
+// ============================================
+const UPLOADS_DIR = path.join(__dirname, 'uploads');
+
+// Ensure uploads directory exists
+if (!fs.existsSync(UPLOADS_DIR)) {
+  fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+}
+
+const diskStorage = multer.diskStorage({
+  destination: (_req, _file, cb) => {
+    cb(null, UPLOADS_DIR);
+  },
+  filename: (_req, file, cb) => {
+    const uniqueSuffix = crypto.randomBytes(8).toString('hex');
+    cb(null, `${uniqueSuffix}-${file.originalname}`);
+  },
+});
+
+// Configure multer for file uploads (200 MB limit) - using disk storage
 const upload = multer({
-  storage: multer.memoryStorage(),
+  storage: diskStorage,
   limits: { fileSize: 200 * 1024 * 1024 }, // 200 MB
 });
 
@@ -19,17 +46,26 @@ app.use(express.json());
 
 // ============================================
 // FILE SESSION CACHE
-// Keep uploaded files in memory to avoid re-uploads
+// Keep references to files on disk to avoid re-uploads
 // ============================================
-const fileCache = new Map(); // sessionId -> { buffer, filename, timestamp }
+const fileCache = new Map(); // sessionId -> { filePath, filename, timestamp }
 const SESSION_TIMEOUT = 60 * 60 * 1000; // 60 minutes
 
-// Clean up expired sessions periodically
+// Clean up expired sessions periodically (also delete files from disk)
 setInterval(() => {
   const now = Date.now();
   for (const [sessionId, data] of fileCache.entries()) {
     if (now - data.timestamp > SESSION_TIMEOUT) {
       console.log(`[cache] Expiring session: ${sessionId}`);
+      // Delete file from disk
+      if (data.filePath && fs.existsSync(data.filePath)) {
+        try {
+          fs.unlinkSync(data.filePath);
+          console.log(`[cache] Deleted file: ${data.filePath}`);
+        } catch (e) {
+          console.error(`[cache] Failed to delete file: ${data.filePath}`, e);
+        }
+      }
       fileCache.delete(sessionId);
     }
   }
@@ -37,6 +73,13 @@ setInterval(() => {
 
 function generateSessionId() {
   return crypto.randomBytes(16).toString('hex');
+}
+
+/**
+ * Helper to read file buffer from disk
+ */
+function readFileBuffer(filePath) {
+  return fs.readFileSync(filePath);
 }
 
 // ============================================
@@ -311,30 +354,34 @@ app.post('/list-tables', upload.single('file'), async (req, res) => {
       return res.status(400).json({ success: false, error: 'Arquivo não fornecido' });
     }
 
-    console.log(`[list-tables] Processing file: ${req.file.originalname}, size: ${req.file.size} bytes`);
+    // File is now on disk at req.file.path
+    const filePath = req.file.path;
+    console.log(`[list-tables] Processing file: ${req.file.originalname}, size: ${req.file.size} bytes, path: ${filePath}`);
 
-    // Generate session ID and cache the file
+    // Generate session ID and cache the file path (not buffer)
     const sessionId = generateSessionId();
     fileCache.set(sessionId, {
-      buffer: req.file.buffer,
+      filePath: filePath,
       filename: req.file.originalname,
       timestamp: Date.now(),
     });
 
     console.log(`[list-tables] Created session: ${sessionId}`);
 
-    const reader = new MDBReader(req.file.buffer);
+    // Read file from disk for parsing
+    const buffer = readFileBuffer(filePath);
+    const reader = new MDBReader(buffer);
     const tableNames = reader.getTableNames();
 
     const tables = tableNames.map((name) => {
       try {
-    const table = reader.getTable(name);
-    const columns = table.getColumnNames();
-    // IMPORTANT: do NOT call table.getData() here.
-    // For large databases, loading all rows of every table can exhaust memory and
-    // crash/reset the process, which surfaces in the client as a network upload error.
-    const rowCount = typeof table.rowCount === 'number' ? table.rowCount : 0;
-    return { name, rowCount, columns };
+        const table = reader.getTable(name);
+        const columns = table.getColumnNames();
+        // IMPORTANT: do NOT call table.getData() here.
+        // For large databases, loading all rows of every table can exhaust memory and
+        // crash/reset the process, which surfaces in the client as a network upload error.
+        const rowCount = typeof table.rowCount === 'number' ? table.rowCount : 0;
+        return { name, rowCount, columns };
       } catch (err) {
         console.error(`Error reading table ${name}:`, err);
         return { name, rowCount: 0, columns: [] };
@@ -364,16 +411,31 @@ app.post('/parse-table', upload.single('file'), async (req, res) => {
     let buffer;
     const sessionId = req.body.sessionId;
 
-    // Try to get file from session cache first
+    // Try to get file from session cache first (read from disk)
     if (sessionId && fileCache.has(sessionId)) {
       console.log(`[parse-table] Using cached file from session: ${sessionId}`);
       const cached = fileCache.get(sessionId);
       cached.timestamp = Date.now(); // Refresh timestamp
-      buffer = cached.buffer;
+      
+      if (!cached.filePath || !fs.existsSync(cached.filePath)) {
+        return res.status(400).json({ 
+          success: false, 
+          error: 'Arquivo da sessão não encontrado. Faça upload novamente.' 
+        });
+      }
+      
+      buffer = readFileBuffer(cached.filePath);
     } else if (req.file) {
-      // Fallback to uploaded file
+      // Fallback to uploaded file (already on disk)
       console.log(`[parse-table] Using uploaded file: ${req.file.originalname}, size: ${req.file.size} bytes`);
-      buffer = req.file.buffer;
+      buffer = readFileBuffer(req.file.path);
+      
+      // Clean up the uploaded file after reading (not needed for session)
+      try {
+        fs.unlinkSync(req.file.path);
+      } catch (e) {
+        console.warn('[parse-table] Failed to delete temp file:', e);
+      }
     } else {
       return res.status(400).json({ 
         success: false, 
@@ -424,6 +486,18 @@ app.post('/clear-session', express.json(), (req, res) => {
   const { sessionId } = req.body;
   
   if (sessionId && fileCache.has(sessionId)) {
+    const cached = fileCache.get(sessionId);
+    
+    // Delete file from disk
+    if (cached.filePath && fs.existsSync(cached.filePath)) {
+      try {
+        fs.unlinkSync(cached.filePath);
+        console.log(`[clear-session] Deleted file: ${cached.filePath}`);
+      } catch (e) {
+        console.error(`[clear-session] Failed to delete file: ${cached.filePath}`, e);
+      }
+    }
+    
     fileCache.delete(sessionId);
     console.log(`[clear-session] Deleted session: ${sessionId}`);
     res.json({ success: true });
