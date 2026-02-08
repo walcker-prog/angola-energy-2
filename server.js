@@ -938,6 +938,649 @@ app.post('/clear-session', express.json(), (req, res) => {
   }
 });
 
+// ============================================
+// SYNC TO SUPABASE - Direct database insertion from Railway
+// This bypasses Edge Function timeout limits
+// ============================================
+app.post('/sync-to-supabase', async (req, res) => {
+  const { 
+    sessionId, 
+    tableName, 
+    fileId, 
+    supabaseUrl, 
+    supabaseKey,
+    deleteExisting = true 
+  } = req.body;
+  
+  if (!sessionId || !tableName || !fileId || !supabaseUrl || !supabaseKey) {
+    return res.status(400).json({ 
+      success: false, 
+      error: 'Parâmetros obrigatórios: sessionId, tableName, fileId, supabaseUrl, supabaseKey' 
+    });
+  }
+  
+  if (!fileCache.has(sessionId)) {
+    return res.status(400).json({ 
+      success: false, 
+      error: 'Sessão não encontrada. Faça upload novamente.' 
+    });
+  }
+  
+  const cached = fileCache.get(sessionId);
+  cached.timestamp = Date.now();
+  
+  if (!cached.filePath || !fs.existsSync(cached.filePath)) {
+    return res.status(400).json({ 
+      success: false, 
+      error: 'Arquivo da sessão não encontrado.' 
+    });
+  }
+  
+  console.log(`[sync-to-supabase] Starting sync: table=${tableName}, fileId=${fileId}`);
+  
+  // Return immediately to avoid timeout - processing will continue in background
+  res.json({ 
+    success: true, 
+    message: 'Sincronização iniciada em background',
+    tableName,
+    fileId
+  });
+  
+  // Continue processing in background
+  (async () => {
+    try {
+      const buffer = readFileBuffer(cached.filePath);
+      const reader = new MDBReader(buffer);
+      const table = reader.getTable(tableName);
+      const columns = table.getColumnNames();
+      
+      // Get all data
+      const allData = table.getData();
+      const totalRows = allData.length;
+      
+      console.log(`[sync-to-supabase] Table ${tableName} has ${totalRows} rows`);
+      
+      // Update status in Supabase
+      const updateStatus = async (status, extra = {}) => {
+        try {
+          const body = {
+            sync_status: status,
+            last_synced_at: new Date().toISOString(),
+            current_table: tableName,
+            ...extra
+          };
+          
+          await fetch(`${supabaseUrl}/rest/v1/access_files?id=eq.${fileId}`, {
+            method: 'PATCH',
+            headers: {
+              'Content-Type': 'application/json',
+              'apikey': supabaseKey,
+              'Authorization': `Bearer ${supabaseKey}`,
+              'Prefer': 'return=minimal'
+            },
+            body: JSON.stringify(body)
+          });
+        } catch (e) {
+          console.error('[sync-to-supabase] Failed to update status:', e.message);
+        }
+      };
+      
+      // Delete existing data for this table if requested
+      if (deleteExisting) {
+        console.log(`[sync-to-supabase] Deleting existing data for ${tableName}`);
+        
+        let deletedCount = 0;
+        let hasMore = true;
+        
+        while (hasMore) {
+          // Select IDs to delete (batch of 500)
+          const selectRes = await fetch(
+            `${supabaseUrl}/rest/v1/access_data?select=id&access_file_id=eq.${fileId}&source_table=eq.${encodeURIComponent(tableName)}&limit=500`,
+            {
+              headers: {
+                'apikey': supabaseKey,
+                'Authorization': `Bearer ${supabaseKey}`
+              }
+            }
+          );
+          
+          if (!selectRes.ok) {
+            console.error('[sync-to-supabase] Failed to select records:', await selectRes.text());
+            break;
+          }
+          
+          const records = await selectRes.json();
+          
+          if (!records || records.length === 0) {
+            hasMore = false;
+            break;
+          }
+          
+          const ids = records.map(r => r.id);
+          
+          // Delete batch
+          const deleteRes = await fetch(
+            `${supabaseUrl}/rest/v1/access_data?id=in.(${ids.map(id => `"${id}"`).join(',')})`,
+            {
+              method: 'DELETE',
+              headers: {
+                'apikey': supabaseKey,
+                'Authorization': `Bearer ${supabaseKey}`,
+                'Prefer': 'return=minimal'
+              }
+            }
+          );
+          
+          if (!deleteRes.ok) {
+            console.error('[sync-to-supabase] Failed to delete batch:', await deleteRes.text());
+            break;
+          }
+          
+          deletedCount += ids.length;
+          
+          if (records.length < 500) {
+            hasMore = false;
+          }
+        }
+        
+        console.log(`[sync-to-supabase] Deleted ${deletedCount} existing records`);
+      }
+      
+      // Insert data in batches
+      const BATCH_SIZE = 500; // Railway can handle larger batches
+      let insertedCount = 0;
+      let failedCount = 0;
+      
+      for (let offset = 0; offset < totalRows; offset += BATCH_SIZE) {
+        const batch = allData.slice(offset, offset + BATCH_SIZE);
+        
+        const records = batch.map((row, i) => ({
+          access_file_id: fileId,
+          source_table: tableName,
+          row_index: offset + i,
+          row_data: row
+        }));
+        
+        // Insert batch with retry
+        let retries = 3;
+        let success = false;
+        
+        while (retries > 0 && !success) {
+          try {
+            const insertRes = await fetch(`${supabaseUrl}/rest/v1/access_data`, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'apikey': supabaseKey,
+                'Authorization': `Bearer ${supabaseKey}`,
+                'Prefer': 'return=minimal'
+              },
+              body: JSON.stringify(records)
+            });
+            
+            if (insertRes.ok) {
+              success = true;
+              insertedCount += records.length;
+            } else {
+              const errText = await insertRes.text();
+              console.error(`[sync-to-supabase] Insert failed (${retries} retries left):`, errText);
+              retries--;
+              
+              if (retries > 0) {
+                await new Promise(r => setTimeout(r, 1000)); // Wait 1s before retry
+              }
+            }
+          } catch (e) {
+            console.error(`[sync-to-supabase] Insert exception (${retries} retries left):`, e.message);
+            retries--;
+            
+            if (retries > 0) {
+              await new Promise(r => setTimeout(r, 1000));
+            }
+          }
+        }
+        
+        if (!success) {
+          failedCount += records.length;
+        }
+        
+        // Update progress every 2000 records
+        if (insertedCount % 2000 < BATCH_SIZE) {
+          await updateStatus('syncing', { records_synced: insertedCount });
+        }
+      }
+      
+      console.log(`[sync-to-supabase] Completed ${tableName}: ${insertedCount} inserted, ${failedCount} failed`);
+      
+      // Update/create table metadata
+      const metadataRes = await fetch(
+        `${supabaseUrl}/rest/v1/access_table_metadata?access_file_id=eq.${fileId}&table_name=eq.${encodeURIComponent(tableName)}`,
+        {
+          headers: {
+            'apikey': supabaseKey,
+            'Authorization': `Bearer ${supabaseKey}`
+          }
+        }
+      );
+      
+      const existingMeta = await metadataRes.json();
+      
+      const metaData = {
+        access_file_id: fileId,
+        table_name: tableName,
+        row_count: insertedCount,
+        column_names: columns,
+        last_synced_at: new Date().toISOString()
+      };
+      
+      if (existingMeta && existingMeta.length > 0) {
+        // Update existing
+        await fetch(
+          `${supabaseUrl}/rest/v1/access_table_metadata?id=eq.${existingMeta[0].id}`,
+          {
+            method: 'PATCH',
+            headers: {
+              'Content-Type': 'application/json',
+              'apikey': supabaseKey,
+              'Authorization': `Bearer ${supabaseKey}`,
+              'Prefer': 'return=minimal'
+            },
+            body: JSON.stringify(metaData)
+          }
+        );
+      } else {
+        // Insert new
+        await fetch(`${supabaseUrl}/rest/v1/access_table_metadata`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'apikey': supabaseKey,
+            'Authorization': `Bearer ${supabaseKey}`,
+            'Prefer': 'return=minimal'
+          },
+          body: JSON.stringify(metaData)
+        });
+      }
+      
+      console.log(`[sync-to-supabase] Updated metadata for ${tableName}`);
+      
+    } catch (err) {
+      console.error(`[sync-to-supabase] Error syncing ${tableName}:`, err);
+    }
+  })();
+});
+
+// ============================================
+// SYNC ALL TABLES - Sync all tables from a session to Supabase
+// ============================================
+app.post('/sync-all-to-supabase', async (req, res) => {
+  const { 
+    sessionId, 
+    fileId, 
+    supabaseUrl, 
+    supabaseKey,
+    forceFullSync = false 
+  } = req.body;
+  
+  if (!sessionId || !fileId || !supabaseUrl || !supabaseKey) {
+    return res.status(400).json({ 
+      success: false, 
+      error: 'Parâmetros obrigatórios: sessionId, fileId, supabaseUrl, supabaseKey' 
+    });
+  }
+  
+  if (!fileCache.has(sessionId)) {
+    return res.status(400).json({ 
+      success: false, 
+      error: 'Sessão não encontrada. Faça upload novamente.' 
+    });
+  }
+  
+  const cached = fileCache.get(sessionId);
+  cached.timestamp = Date.now();
+  
+  if (!cached.filePath || !fs.existsSync(cached.filePath)) {
+    return res.status(400).json({ 
+      success: false, 
+      error: 'Arquivo da sessão não encontrado.' 
+    });
+  }
+  
+  console.log(`[sync-all] Starting full sync: fileId=${fileId}, forceFullSync=${forceFullSync}`);
+  
+  // Get table list
+  const buffer = readFileBuffer(cached.filePath);
+  const reader = new MDBReader(buffer);
+  const tableNames = reader.getTableNames();
+  
+  const tables = tableNames.map((name) => {
+    try {
+      const table = reader.getTable(name);
+      return { name, rowCount: table.getData().length, columns: table.getColumnNames() };
+    } catch (err) {
+      return { name, rowCount: 0, columns: [] };
+    }
+  });
+  
+  console.log(`[sync-all] Found ${tables.length} tables to sync`);
+  
+  // Return immediately
+  res.json({ 
+    success: true, 
+    message: 'Sincronização iniciada em background',
+    fileId,
+    tableCount: tables.length,
+    tables: tables.map(t => ({ name: t.name, rowCount: t.rowCount }))
+  });
+  
+  // Continue in background
+  (async () => {
+    try {
+      const updateFileStatus = async (status, extra = {}) => {
+        try {
+          const body = {
+            sync_status: status,
+            last_synced_at: new Date().toISOString(),
+            ...extra
+          };
+          
+          await fetch(`${supabaseUrl}/rest/v1/access_files?id=eq.${fileId}`, {
+            method: 'PATCH',
+            headers: {
+              'Content-Type': 'application/json',
+              'apikey': supabaseKey,
+              'Authorization': `Bearer ${supabaseKey}`,
+              'Prefer': 'return=minimal'
+            },
+            body: JSON.stringify(body)
+          });
+        } catch (e) {
+          console.error('[sync-all] Failed to update status:', e.message);
+        }
+      };
+      
+      // Get already synced tables if not forcing full sync
+      let syncedTableNames = new Set();
+      if (!forceFullSync) {
+        try {
+          const metaRes = await fetch(
+            `${supabaseUrl}/rest/v1/access_table_metadata?select=table_name&access_file_id=eq.${fileId}`,
+            {
+              headers: {
+                'apikey': supabaseKey,
+                'Authorization': `Bearer ${supabaseKey}`
+              }
+            }
+          );
+          
+          if (metaRes.ok) {
+            const meta = await metaRes.json();
+            
+            // Check which tables have actual data
+            for (const m of meta) {
+              const countRes = await fetch(
+                `${supabaseUrl}/rest/v1/access_data?select=id&access_file_id=eq.${fileId}&source_table=eq.${encodeURIComponent(m.table_name)}&limit=1`,
+                {
+                  headers: {
+                    'apikey': supabaseKey,
+                    'Authorization': `Bearer ${supabaseKey}`
+                  }
+                }
+              );
+              
+              if (countRes.ok) {
+                const data = await countRes.json();
+                if (data && data.length > 0) {
+                  syncedTableNames.add(m.table_name);
+                }
+              }
+            }
+          }
+        } catch (e) {
+          console.error('[sync-all] Failed to get synced tables:', e.message);
+        }
+      }
+      
+      const tablesToSync = forceFullSync 
+        ? tables 
+        : tables.filter(t => !syncedTableNames.has(t.name));
+      
+      console.log(`[sync-all] Syncing ${tablesToSync.length} tables (${syncedTableNames.size} already synced)`);
+      
+      await updateFileStatus('syncing', { 
+        tables_synced: syncedTableNames.size,
+        records_synced: 0 
+      });
+      
+      let totalTablesCompleted = syncedTableNames.size;
+      let totalRecordsSynced = 0;
+      
+      // Get current record count if resuming
+      if (!forceFullSync && syncedTableNames.size > 0) {
+        try {
+          const fileRes = await fetch(
+            `${supabaseUrl}/rest/v1/access_files?select=records_synced&id=eq.${fileId}`,
+            {
+              headers: {
+                'apikey': supabaseKey,
+                'Authorization': `Bearer ${supabaseKey}`,
+                'Accept': 'application/vnd.pgrst.object+json'
+              }
+            }
+          );
+          
+          if (fileRes.ok) {
+            const fileData = await fileRes.json();
+            totalRecordsSynced = fileData?.records_synced || 0;
+          }
+        } catch (e) {
+          console.error('[sync-all] Failed to get current record count:', e.message);
+        }
+      }
+      
+      for (const table of tablesToSync) {
+        console.log(`[sync-all] Processing table: ${table.name} (${table.rowCount} rows)`);
+        
+        await updateFileStatus('syncing', { 
+          current_table: table.name,
+          tables_synced: totalTablesCompleted,
+          records_synced: totalRecordsSynced
+        });
+        
+        // Delete existing data
+        let deletedCount = 0;
+        let hasMore = true;
+        
+        while (hasMore) {
+          const selectRes = await fetch(
+            `${supabaseUrl}/rest/v1/access_data?select=id&access_file_id=eq.${fileId}&source_table=eq.${encodeURIComponent(table.name)}&limit=500`,
+            {
+              headers: {
+                'apikey': supabaseKey,
+                'Authorization': `Bearer ${supabaseKey}`
+              }
+            }
+          );
+          
+          if (!selectRes.ok) break;
+          
+          const records = await selectRes.json();
+          
+          if (!records || records.length === 0) {
+            hasMore = false;
+            break;
+          }
+          
+          const ids = records.map(r => r.id);
+          
+          await fetch(
+            `${supabaseUrl}/rest/v1/access_data?id=in.(${ids.map(id => `"${id}"`).join(',')})`,
+            {
+              method: 'DELETE',
+              headers: {
+                'apikey': supabaseKey,
+                'Authorization': `Bearer ${supabaseKey}`,
+                'Prefer': 'return=minimal'
+              }
+            }
+          );
+          
+          deletedCount += ids.length;
+          
+          if (records.length < 500) hasMore = false;
+        }
+        
+        if (deletedCount > 0) {
+          console.log(`[sync-all] Deleted ${deletedCount} existing records from ${table.name}`);
+        }
+        
+        // Get table data
+        const tableObj = reader.getTable(table.name);
+        const allData = tableObj.getData();
+        const columns = tableObj.getColumnNames();
+        
+        // Insert in batches
+        const BATCH_SIZE = 500;
+        let tableInserted = 0;
+        
+        for (let offset = 0; offset < allData.length; offset += BATCH_SIZE) {
+          const batch = allData.slice(offset, offset + BATCH_SIZE);
+          
+          const records = batch.map((row, i) => ({
+            access_file_id: fileId,
+            source_table: table.name,
+            row_index: offset + i,
+            row_data: row
+          }));
+          
+          let retries = 3;
+          let success = false;
+          
+          while (retries > 0 && !success) {
+            try {
+              const insertRes = await fetch(`${supabaseUrl}/rest/v1/access_data`, {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'apikey': supabaseKey,
+                  'Authorization': `Bearer ${supabaseKey}`,
+                  'Prefer': 'return=minimal'
+                },
+                body: JSON.stringify(records)
+              });
+              
+              if (insertRes.ok) {
+                success = true;
+                tableInserted += records.length;
+                totalRecordsSynced += records.length;
+              } else {
+                retries--;
+                if (retries > 0) await new Promise(r => setTimeout(r, 1000));
+              }
+            } catch (e) {
+              retries--;
+              if (retries > 0) await new Promise(r => setTimeout(r, 1000));
+            }
+          }
+          
+          // Update progress every 2000 records
+          if (tableInserted % 2000 < BATCH_SIZE) {
+            await updateFileStatus('syncing', { 
+              records_synced: totalRecordsSynced,
+              tables_synced: totalTablesCompleted
+            });
+          }
+        }
+        
+        // Update metadata
+        const metaData = {
+          access_file_id: fileId,
+          table_name: table.name,
+          row_count: tableInserted,
+          column_names: columns,
+          last_synced_at: new Date().toISOString()
+        };
+        
+        // Check if metadata exists
+        const metaRes = await fetch(
+          `${supabaseUrl}/rest/v1/access_table_metadata?access_file_id=eq.${fileId}&table_name=eq.${encodeURIComponent(table.name)}`,
+          {
+            headers: {
+              'apikey': supabaseKey,
+              'Authorization': `Bearer ${supabaseKey}`
+            }
+          }
+        );
+        
+        const existingMeta = await metaRes.json();
+        
+        if (existingMeta && existingMeta.length > 0) {
+          await fetch(
+            `${supabaseUrl}/rest/v1/access_table_metadata?id=eq.${existingMeta[0].id}`,
+            {
+              method: 'PATCH',
+              headers: {
+                'Content-Type': 'application/json',
+                'apikey': supabaseKey,
+                'Authorization': `Bearer ${supabaseKey}`,
+                'Prefer': 'return=minimal'
+              },
+              body: JSON.stringify(metaData)
+            }
+          );
+        } else {
+          await fetch(`${supabaseUrl}/rest/v1/access_table_metadata`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'apikey': supabaseKey,
+              'Authorization': `Bearer ${supabaseKey}`,
+              'Prefer': 'return=minimal'
+            },
+            body: JSON.stringify(metaData)
+          });
+        }
+        
+        totalTablesCompleted++;
+        console.log(`[sync-all] Completed ${table.name}: ${tableInserted} records (${totalTablesCompleted}/${tables.length})`);
+        
+        await updateFileStatus('syncing', { 
+          tables_synced: totalTablesCompleted,
+          records_synced: totalRecordsSynced
+        });
+      }
+      
+      // Mark as completed
+      await updateFileStatus('completed', { 
+        tables_synced: tables.length,
+        records_synced: totalRecordsSynced,
+        current_table: null
+      });
+      
+      console.log(`[sync-all] Sync completed: ${tables.length} tables, ${totalRecordsSynced} records`);
+      
+    } catch (err) {
+      console.error('[sync-all] Fatal error:', err);
+      
+      // Mark as failed
+      try {
+        await fetch(`${supabaseUrl}/rest/v1/access_files?id=eq.${fileId}`, {
+          method: 'PATCH',
+          headers: {
+            'Content-Type': 'application/json',
+            'apikey': supabaseKey,
+            'Authorization': `Bearer ${supabaseKey}`,
+            'Prefer': 'return=minimal'
+          },
+          body: JSON.stringify({ sync_status: 'failed' })
+        });
+      } catch (e) {
+        console.error('[sync-all] Failed to mark as failed:', e.message);
+      }
+    }
+  })();
+});
+
 app.listen(PORT, () => {
   console.log(`Access Parser Server running on port ${PORT}`);
   console.log(`Health check: http://localhost:${PORT}/health`);
