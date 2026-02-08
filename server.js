@@ -754,6 +754,85 @@ app.post('/list-tables-from-url', async (req, res) => {
     res.status(500).json({ success: false, error: err.message || 'Erro ao processar arquivo' });
   }
 });
+
+// ============================================
+// PARSE TABLE BATCH - Paginated data retrieval
+// Avoids memory issues by returning data in batches
+// ============================================
+app.post('/parse-table-batch', async (req, res) => {
+  try {
+    const { sessionId, tableName, offset = 0, limit = 1000 } = req.body;
+    
+    if (!tableName) {
+      return res.status(400).json({ success: false, error: 'Nome da tabela não fornecido' });
+    }
+    
+    if (!sessionId || !fileCache.has(sessionId)) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Sessão não encontrada. Faça upload novamente.' 
+      });
+    }
+    
+    const cached = fileCache.get(sessionId);
+    cached.timestamp = Date.now(); // Keep alive
+    
+    if (!cached.filePath || !fs.existsSync(cached.filePath)) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Arquivo da sessão não encontrado.' 
+      });
+    }
+    
+    console.log(`[parse-table-batch] Table=${tableName}, offset=${offset}, limit=${limit}`);
+    
+    const buffer = readFileBuffer(cached.filePath);
+    const reader = new MDBReader(buffer);
+    const table = reader.getTable(tableName);
+    const columns = table.getColumnNames();
+    const totalRows = typeof table.rowCount === 'number' ? table.rowCount : 0;
+    
+    // Get all data and slice (mdb-reader doesn't support pagination natively)
+    const allData = table.getData();
+    const slicedData = allData.slice(offset, offset + limit);
+    
+    // Detect data type
+    const dataType = detectDataType(columns);
+    
+    // Parse rows
+    const rows = [];
+    for (let i = 0; i < slicedData.length; i++) {
+      const row = slicedData[i];
+      const globalIndex = offset + i;
+      const result = dataType === 'production'
+        ? parseProductionRow(row, columns, globalIndex)
+        : parseWellsRow(row, columns, globalIndex);
+      
+      rows.push(result);
+    }
+    
+    const hasMore = offset + slicedData.length < totalRows;
+    
+    console.log(`[parse-table-batch] Returned ${rows.length} rows, hasMore=${hasMore}`);
+    
+    res.json({
+      success: true,
+      tableName,
+      columns,
+      dataType,
+      totalRows,
+      offset,
+      limit,
+      rows,
+      hasMore,
+    });
+    
+  } catch (err) {
+    console.error('[parse-table-batch] Error:', err);
+    res.status(500).json({ success: false, error: err.message || 'Erro ao processar tabela' });
+  }
+});
+
 app.post('/parse-table', upload.single('file'), async (req, res) => {
   try {
     const tableName = req.body.tableName;
