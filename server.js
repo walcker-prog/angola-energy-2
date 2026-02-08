@@ -468,6 +468,43 @@ app.post('/upload-init', (req, res) => {
   }
 });
 
+app.get('/upload-status', (req, res) => {
+  try {
+    const uploadId = String(req.query?.uploadId || '').trim();
+    if (!uploadId) {
+      return res.status(400).json({ success: false, error: 'uploadId não fornecido' });
+    }
+
+    if (!chunkSessions.has(uploadId)) {
+      return res.status(404).json({ success: false, error: 'Upload não encontrado ou expirado. Reenvie o arquivo.' });
+    }
+
+    const session = chunkSessions.get(uploadId);
+    const dirPath = session?.dirPath;
+
+    let receivedIndices = [];
+    if (dirPath && fs.existsSync(dirPath)) {
+      const entries = fs.readdirSync(dirPath, { withFileTypes: true });
+      receivedIndices = entries
+        .filter((e) => e.isFile() && e.name.endsWith('.part'))
+        .map((e) => Number(e.name.replace('.part', '')))
+        .filter((n) => Number.isFinite(n))
+        .sort((a, b) => a - b);
+    }
+
+    res.json({
+      success: true,
+      uploadId,
+      totalChunks: session?.totalChunks ?? null,
+      received: receivedIndices.length,
+      receivedIndices,
+    });
+  } catch (err) {
+    console.error('[upload-status] Error:', err);
+    res.status(500).json({ success: false, error: err.message || 'Erro ao obter status do upload' });
+  }
+});
+
 app.post('/upload-chunk', chunkUpload.single('chunk'), (req, res) => {
   try {
     const uploadId = req.body?.uploadId;
@@ -650,8 +687,73 @@ app.post('/list-tables', upload.single('file'), async (req, res) => {
 });
 
 // ============================================
-// PARSE TABLE - Use sessionId OR upload file
+// LIST TABLES FROM URL - Download file from signed URL
+// This is used by the Edge Function to avoid memory limits
 // ============================================
+app.post('/list-tables-from-url', async (req, res) => {
+  try {
+    const { fileUrl, filename } = req.body;
+    
+    if (!fileUrl) {
+      return res.status(400).json({ success: false, error: 'URL do arquivo não fornecida' });
+    }
+    
+    console.log(`[list-tables-from-url] Downloading file from signed URL: ${filename || 'unknown'}`);
+    
+    // Download file from the signed URL
+    const response = await fetch(fileUrl);
+    
+    if (!response.ok) {
+      console.error(`[list-tables-from-url] Failed to download: ${response.status} ${response.statusText}`);
+      return res.status(400).json({ success: false, error: `Erro ao baixar arquivo: ${response.status}` });
+    }
+    
+    // Get file as array buffer and write to disk
+    const arrayBuffer = await response.arrayBuffer();
+    const buffer = Buffer.from(arrayBuffer);
+    
+    console.log(`[list-tables-from-url] Downloaded ${buffer.length} bytes`);
+    
+    // Save to disk
+    const sessionId = generateSessionId();
+    const safeFilename = sanitizeFilename(filename || 'download.accdb');
+    const finalPath = path.join(UPLOADS_DIR, `${sessionId}-${safeFilename}`);
+    
+    fs.writeFileSync(finalPath, buffer);
+    
+    // Cache file path
+    fileCache.set(sessionId, {
+      filePath: finalPath,
+      filename: safeFilename,
+      timestamp: Date.now(),
+    });
+    
+    console.log(`[list-tables-from-url] Created session: ${sessionId}, file: ${finalPath}`);
+    
+    // Parse tables
+    const reader = new MDBReader(buffer);
+    const tableNames = reader.getTableNames();
+    
+    const tables = tableNames.map((name) => {
+      try {
+        const table = reader.getTable(name);
+        const columns = table.getColumnNames();
+        const rowCount = typeof table.rowCount === 'number' ? table.rowCount : 0;
+        return { name, rowCount, columns };
+      } catch (err) {
+        console.error(`Error reading table ${name}:`, err);
+        return { name, rowCount: 0, columns: [] };
+      }
+    });
+    
+    console.log(`[list-tables-from-url] Found ${tables.length} tables`);
+    res.json({ success: true, tables, sessionId });
+    
+  } catch (err) {
+    console.error('[list-tables-from-url] Error:', err);
+    res.status(500).json({ success: false, error: err.message || 'Erro ao processar arquivo' });
+  }
+});
 app.post('/parse-table', upload.single('file'), async (req, res) => {
   try {
     const tableName = req.body.tableName;
